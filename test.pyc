@@ -1,0 +1,251 @@
+#
+# Copyright (c) FIRST and other WPILib contributors.
+# Open Source Software; you can modify and/or share it under the terms of
+# the WPILib BSD license file in the root directory of this project.
+#
+
+import commands2
+from commands2 import cmd
+from commands2.button import CommandXboxController, Trigger
+from commands2.sysid import SysIdRoutine
+
+from generated.tuner_constants import TunerConstants
+from telemetry import Telemetry
+
+from phoenix6.hardware import TalonFX
+from phoenix6.configs import TalonFXConfiguration
+from phoenix6 import controls, hardware
+from phoenix6 import swerve
+from phoenix6 import configs
+import phoenix6
+
+from subsystems.shooter import ShooterSubsystem
+
+from wpilib import DriverStation
+from wpimath.geometry import Rotation2d
+from wpimath.units import rotationsToRadians
+
+
+class RobotContainer:
+    """
+    This class is where the bulk of the robot should be declared. Since Command-based is a
+    "declarative" paradigm, very little robot logic should actually be handled in the :class:`.Robot`
+    periodic methods (other than the scheduler calls). Instead, the structure of the robot (including
+    subsystems, commands, and button mappings) should be declared here.
+    """
+
+    def __init__(self) -> None:
+        self._max_speed = (
+            1.0 * TunerConstants.speed_at_12_volts
+        )  # speed_at_12_volts desired top speed
+        self._max_angular_rate = rotationsToRadians(
+            0.75
+        )  # 3/4 of a rotation per second max angular velocity
+
+        # Setting up bindings for necessary control of the swerve drive platform
+        self._drive = (
+            swerve.requests.FieldCentric()
+            .with_deadband(self._max_speed * 0.1)
+            .with_rotational_deadband(
+                self._max_angular_rate * 0.1
+            )  # Add a 10% deadband
+            .with_drive_request_type(
+                swerve.SwerveModule.DriveRequestType.OPEN_LOOP_VOLTAGE
+            )  # Use open-loop control for drive motors
+        )
+        self._brake = swerve.requests.SwerveDriveBrake()
+        self._point = swerve.requests.PointWheelsAt()
+
+        self._logger = Telemetry(self._max_speed)
+
+        self.shooter = ShooterSubsystem()
+
+        # Intake Pivot and Intake
+        self.motor_intake_pivot = hardware.TalonFX(38)
+        self.motor_intake = TalonFX(39)
+
+        # Shooter and Shooter Intake
+        self.motor_shooter_intake = TalonFX(48)
+        self.motor_shooter = TalonFX(49)
+        shooter_configs = configs.TalonFXConfiguration()
+           
+
+        # Pre-define Control Requests
+        self.neutral_stop = phoenix6.controls.NeutralOut()
+
+        self.pivot_forward = phoenix6.controls.DutyCycleOut(0.2)
+        self.pivot_reverse = phoenix6.controls.DutyCycleOut(-0.2)
+        self.pivot_hold_up = phoenix6.controls.DutyCycleOut(0.08)
+        self.pivot_hold_down = phoenix6.controls.DutyCycleOut(0.08)
+        self.intake_speed = phoenix6.controls.DutyCycleOut(-0.5)
+
+        self.intake_shooter_speed = phoenix6.controls.DutyCycleOut(.2)
+        self.shooter_speed = phoenix6.controls.DutyCycleOut(-.4)
+
+
+        # Configure BRAKE mode
+        pivot_cfg = phoenix6.configs.TalonFXConfiguration()
+        pivot_cfg.motor_output.neutral_mode = phoenix6.signals.NeutralModeValue.BRAKE
+        self.motor_intake_pivot.configurator.apply(pivot_cfg)
+
+
+
+        # 1. Stator Current Limit (Protects the motor and internal gears)
+        # This limits the current inside the motor. 80A is a safe 'high performance' limit.
+        shooter_configs.current_limits.stator_current_limit = 80.0
+        shooter_configs.current_limits.stator_current_limit_enable = True
+
+        # 2. Supply Current Limit (Protects the 40A Breaker and Battery)
+        # This limits the current drawn from the PDP/PDH. 
+        # We set this near 40A to match the breaker.
+        shooter_configs.current_limits.supply_current_limit = 40.0
+        shooter_configs.current_limits.supply_current_limit_enable = True
+
+        # 3. Optional: Ramp Rate (Prevents instant jerky starts)
+        # This takes 0.1 seconds to go from 0 to full power, reducing the initial "spike"
+        shooter_configs.closed_loop_ramps.voltage_closed_loop_ramp_period = 0.1
+        shooter_configs.open_loop_ramps.voltage_open_loop_ramp_period = 0.1
+
+        # Apply the settings to your motor
+        self.motor_shooter.configurator.apply(shooter_configs)
+
+
+        self._joystick = CommandXboxController(0)
+
+        self.drivetrain = TunerConstants.create_drivetrain()
+
+        # Configure the button bindings
+        self.configureButtonBindings()
+
+    def configureButtonBindings(self) -> None:
+        """
+        Use this method to define your button->command mappings. Buttons can be created by
+        instantiating a :GenericHID or one of its subclasses (Joystick or XboxController),
+        and then passing it to a JoystickButton.
+        """
+
+        # Note that X is defined as forward according to WPILib convention,
+        # and Y is defined as to the left according to WPILib convention.
+        self.drivetrain.setDefaultCommand(
+            # Drivetrain will execute this command periodically
+            self.drivetrain.apply_request(
+                lambda: (
+                    self._drive.with_velocity_x(
+                        -self._joystick.getLeftY() * self._max_speed
+                    )  # Drive forward with negative Y (forward)
+                    .with_velocity_y(
+                        -self._joystick.getLeftX() * self._max_speed
+                    )  # Drive left with negative X (left)
+                    .with_rotational_rate(
+                        -self._joystick.getRightX() * self._max_angular_rate
+                    )  # Drive counterclockwise with negative X (left)
+                )
+            )
+        )
+
+        # Idle while the robot is disabled. This ensures the configured
+        # neutral mode is applied to the drive motors while disabled.
+        idle = swerve.requests.Idle()
+        Trigger(DriverStation.isDisabled).whileTrue(
+            self.drivetrain.apply_request(lambda: idle).ignoringDisable(True)
+        )
+
+        self._joystick.a().whileTrue(self.drivetrain.apply_request(lambda: self._brake))
+        self._joystick.b().whileTrue(
+            self.drivetrain.apply_request(
+                lambda: self._point.with_module_direction(
+                    Rotation2d(-self._joystick.getLeftY(), -self._joystick.getLeftX())
+                )
+            )
+        )
+
+        # Run SysId routines when holding back/start and X/Y.
+        # Note that each routine should be run exactly once in a single log.
+        (self._joystick.back() & self._joystick.y()).whileTrue(
+            self.drivetrain.sys_id_dynamic(SysIdRoutine.Direction.kForward)
+        )
+        (self._joystick.back() & self._joystick.x()).whileTrue(
+            self.drivetrain.sys_id_dynamic(SysIdRoutine.Direction.kReverse)
+        )
+        (self._joystick.start() & self._joystick.y()).whileTrue(
+            self.drivetrain.sys_id_quasistatic(SysIdRoutine.Direction.kForward)
+        )
+        (self._joystick.start() & self._joystick.x()).whileTrue(
+            self.drivetrain.sys_id_quasistatic(SysIdRoutine.Direction.kReverse)
+        )
+
+        # reset the field-centric heading on left bumper press
+        self._joystick.leftBumper().onTrue(
+            self.drivetrain.runOnce(self.drivetrain.seed_field_centric)
+        )
+
+        self.drivetrain.register_telemetry(
+            lambda state: self._logger.telemeterize(state)
+        )
+
+        # Pivot Intake
+        self._joystick.povUp().whileTrue(commands2.RunCommand(
+            lambda: self.motor_intake_pivot.set_control(self.pivot_forward)
+            ).finallyDo(lambda interrupted: self.motor_intake_pivot.set_control(self.neutral_stop))
+            )
+
+        # D-Pad DOWN: Move Pivot Backward
+        self._joystick.povDown().whileTrue(commands2.RunCommand(
+            lambda: self.motor_intake_pivot.set_control(self.pivot_reverse)
+            ).finallyDo(lambda interrupted: self.motor_intake_pivot.set_control(self.neutral_stop))
+            )
+
+        # Intake
+        self._joystick.x().whileTrue(commands2.RunCommand(
+            lambda: self.motor_intake.set_control(self.intake_speed)
+            ).finallyDo(lambda interrupted: self.motor_intake.set_control(self.neutral_stop))
+            )
+        
+
+        # Shooter
+        # We use .alongWith to run them together
+        # Binds to the 'Y' button
+
+        self._joystick.y().whileTrue(
+            # Run the feeder and flywheel together
+            commands2.RunCommand(
+                lambda: self.shooter.run_flywheel(9.0), # Run flywheel at 9 Volts
+                self.shooter
+            ).alongWith(
+                commands2.RunCommand(
+                    lambda: self.shooter.run_feeder(0.3), # Run feeder at 30%
+                    self.shooter 
+                )
+            ).finallyDo(
+                lambda interrupted: self.shooter.stop() # Stop when button released
+            )
+        )
+
+
+
+    def getAutonomousCommand(self) -> commands2.Command:
+        """
+        Use this to pass the autonomous command to the main {@link Robot} class.
+
+        :returns: the command to run in autonomous
+        """
+        # Simple drive forward auton
+        idle = swerve.requests.Idle()
+        return cmd.sequence(
+            # Reset our field centric heading to match the robot
+            # facing away from our alliance station wall (0 deg).
+            self.drivetrain.runOnce(
+                lambda: self.drivetrain.seed_field_centric(Rotation2d.fromDegrees(0))
+            ),
+            # Then slowly drive forward (away from us) for 5 seconds.
+            self.drivetrain.apply_request(
+                lambda: (
+                    self._drive.with_velocity_x(0.5)
+                    .with_velocity_y(0)
+                    .with_rotational_rate(0)
+                )
+            )
+            .withTimeout(5.0),
+            # Finally idle for the rest of auton
+            self.drivetrain.apply_request(lambda: idle)
+        )
